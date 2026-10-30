@@ -85,6 +85,20 @@
 #   link's zip name, then by display name + category - so the bump lands
 #   on the SAME entry even if your catalog id differs from the slug.
 #
+# PLUGIN SUBTYPE: aeplugin vs core
+# -------------------------------
+# Plugins install to either AE Plug-ins (aeplugin) or MediaCore (core).
+# The subtype is picked in this priority:
+#   1. Tag prefix:  core-... -> core ; plugin-/aeplugin-... -> aeplugin
+#   2. Filename token (for the one-tag-for-all-assets model where the tag
+#      can't carry a per-asset prefix):
+#        Name.core.zip      -> core     (MediaCore)
+#        Name.aeplugin.zip  -> aeplugin (AE Plug-ins)
+#      Token-boundary aware: "CoreFX.zip" / "hardcore.zip" stay default.
+#   3. Default: aeplugin.
+# Existing entries' plugin_type is PRESERVED on every reconcile - set it
+# by hand once in After-Effect-HUB.json and it sticks across all refreshes.
+#
 # REPLACES the older two-file setup: if you copied the previous
 # update-catalog.yml + tools/update_catalog.py into After-Effect-HUB,
 # delete BOTH before adding this one (two workflows must not both fire).
@@ -251,9 +265,12 @@ jobs:
 
           def base_key(text):
               """Normalize a package name for comparison: lowercase, drop
-              the version suffix, drop all non-alphanumerics. "Bionic
-              Blur 1.2" and "bionic-blur-1.0" both -> "bionicblur"."""
+              the version suffix AND any core/aeplugin token, drop all
+              non-alphanumerics. "Bionic Blur 1.2", "bionic-blur-1.0",
+              and "Bionic.core-1.0" all -> "bionicblur"."""
               stem = re.sub(r"\.[A-Za-z0-9]{1,5}$", "", str(text))
+              stem = re.sub(r"(?:^|[-_.])(?:core|aeplugin)(?:[-_.]|$)", " ",
+                            stem, flags=re.IGNORECASE)
               name, _ = split_version(stem)
               return re.sub(r"[^a-z0-9]+", "", (name or stem).lower())
 
@@ -323,42 +340,75 @@ jobs:
 
           def derive_from(fname, zip_path, tag):
               """Derive category/name/version/id for a new asset. Returns
-              (category, ptype, name, version, id_, version_found).
-              version_found is False when version fell back to 1.0.0, so
-              callers can preserve a hand-edited version on refresh."""
+              (category, ptype, name, version, id_, version_found,
+              ptype_found). version_found is False when version fell back
+              to 1.0.0; ptype_found is False when the plugin subtype
+              defaulted to aeplugin (no tag prefix or filename token) -
+              callers use both to preserve hand-edited values on refresh."""
               stem = re.sub(r"\.[A-Za-z0-9]{1,5}$", "", fname)
               tcat, tptype, trest = split_prefix(tag)
               tname, tver = split_version(trest)
               tag_named = bool(tname) and (tver is not None
                                            or tcat is not None)
-              fn_name, fn_ver = split_version(stem)
+              # For naming, strip a core/aeplugin token from the stem so
+              # "Newton.core.zip" -> name "Newton" (not "Newton.core").
+              # Token-boundary aware; falls back to the raw stem if
+              # stripping would empty it (a plugin literally named Core).
+              stem_name = re.sub(
+                  r"(?:^|[-_.])(?:core|aeplugin)(?:[-_.]|$)", " ", stem,
+                  flags=re.IGNORECASE).strip(" -_.") or stem
+              fn_name, fn_ver = split_version(stem_name)
               if tag_named:
                   name = display_name(tname)
                   version = tver or fn_ver or "1.0.0"
               else:
-                  name = display_name(fn_name or stem)
+                  name = display_name(fn_name or stem_name)
                   version = fn_ver or tver or "1.0.0"
               version_found = (tver is not None) or (fn_ver is not None)
               category = tcat or sniff(zip_path)
               ptype = tptype
+              ptype_found = tptype is not None
               if category is None:
                   print("note: %s: type not detected from contents - "
                         "defaulting to plugin (use a tag prefix like "
                         "plugin-... to force one)" % fname)
                   category = "plugin"
               if category == "plugin" and not ptype:
+                  # No tag prefix declared the subtype. In the one-tag-
+                  # for-all-assets model the tag can't carry a per-asset
+                  # prefix, so let the FILENAME declare it:
+                  #   Name.core.zip      -> core     (MediaCore)
+                  #   Name.aeplugin.zip  -> aeplugin (AE Plug-ins)
+                  # Boundary-aware: "CoreFX" / "hardcore" stay default.
+                  sl = stem.lower()
+                  if re.search(r"(?:^|[-_.])core(?:[-_.]|$)", sl):
+                      ptype = "core"
+                      ptype_found = True
+                  elif re.search(r"(?:^|[-_.])aeplugin(?:[-_.]|$)", sl):
+                      ptype = "aeplugin"
+                      ptype_found = True
+              if category == "plugin" and not ptype:
                   ptype = "aeplugin"
               return (category, ptype, name, version, make_id(name),
-                      version_found)
+                      version_found, ptype_found)
 
           def reconcile(asset_dir, tag, repo, today):
               """Reconcile the catalog against the FULL asset list of one
-              release. For every entry whose link points at <tag>: if its
-              asset is still in the release, refresh sha/size/link (and
-              version only when one was parsed from the name), preserving
-              hand-edited name/category/description/tags; if the asset is
-              gone, drop the entry. Assets with no matching entry are
-              added. An empty asset download aborts without touching the
+              release, in TWO passes:
+                1. Exact filename match - refresh sha/size/link, version
+                   (when parsed from the name), and plugin_type (when a
+                   signal token/prefix is present); preserve hand-edited
+                   name/description/tags.
+                2. Base-key match for RENAMED assets (e.g. Glitchify-1.0.0
+                   re-uploaded as Glitchify-1.0.1, or Newton.zip renamed
+                   Newton.core.zip) - refactor the SAME entry in place to
+                   the new filename, preserving hand-edits. This is the
+                   "refactor old entries" path: the entry keeps its id /
+                   name / description / tags and just gets a new link,
+                   version, sha, and (if a token signal is present) a new
+                   plugin_type.
+              Assets with no match at all are added; entries with no match
+              are removed. An empty download aborts without touching the
               catalog (guards against a failed download wiping entries)."""
               assets = {}
               for p in sorted(glob.glob(os.path.join(asset_dir, "*"))):
@@ -376,6 +426,9 @@ jobs:
               kept = []
               matched = set()
               added = refreshed = removed = 0
+              unmatched_entries = []
+
+              # Pass 1: exact filename match -> refresh in place.
               for e in items:
                   if not isinstance(e, dict):
                       kept.append(e)
@@ -391,6 +444,8 @@ jobs:
                       new_sha = sha256_of(zp)
                       new_size = os.path.getsize(zp)
                       new_link = build_link(repo, tag, fn)
+                      cat, ptype, name, ver, id_, vf, pf = derive_from(
+                          fn, zp, tag)
                       changed = False
                       if (e.get("sha256") != new_sha
                               or e.get("size_bytes") != new_size
@@ -399,10 +454,14 @@ jobs:
                           e["size_bytes"] = new_size
                           e["link"] = new_link
                           changed = True
-                      cat, ptype, name, ver, id_, vf = derive_from(
-                          fn, zp, tag)
                       if vf and e.get("version") != ver:
                           e["version"] = ver
+                          changed = True
+                      # Flip plugin_type only when a signal (token/prefix)
+                      # declared one - never overwrite a hand-set value
+                      # with the default aeplugin.
+                      if pf and e.get("plugin_type") != ptype:
+                          e["plugin_type"] = ptype
                           changed = True
                       if changed:
                           e["last_updated"] = today
@@ -415,14 +474,57 @@ jobs:
                       kept.append(e)
                       matched.add(fn)
                   else:
-                      removed += 1
-                      print("removed %s (asset %s no longer in release)"
-                            % (label, fn))
-              for fn in sorted(assets):
-                  if fn in matched:
-                      continue
-                  zp = assets[fn]
-                  cat, ptype, name, ver, id_, vf = derive_from(fn, zp, tag)
+                      unmatched_entries.append(e)
+
+              # Pass 2: base-key match for renamed assets -> refactor in
+              # place. Keeps the entry's id/name/description/tags; swaps
+              # link + sha + size + version (+ plugin_type if signaled).
+              remaining = {fn: assets[fn] for fn in assets
+                           if fn not in matched}
+              still_unmatched = []
+              for e in unmatched_entries:
+                  old_fn = str(e.get("link", "")).rsplit("/", 1)[-1]
+                  old_base = base_key(old_fn)
+                  match_fn = None
+                  for afn in remaining:
+                      if base_key(afn) == old_base:
+                          match_fn = afn
+                          break
+                  if match_fn:
+                      zp = remaining[match_fn]
+                      e["link"] = build_link(repo, tag, match_fn)
+                      e["sha256"] = sha256_of(zp)
+                      e["size_bytes"] = os.path.getsize(zp)
+                      e["last_updated"] = today
+                      cat, ptype, name, ver, id_, vf, pf = derive_from(
+                          match_fn, zp, tag)
+                      if vf and e.get("version") != ver:
+                          e["version"] = ver
+                      if pf and e.get("plugin_type") != ptype:
+                          e["plugin_type"] = ptype
+                      kept.append(e)
+                      matched.add(match_fn)
+                      del remaining[match_fn]
+                      refreshed += 1
+                      print("renamed %s -> %s (refactored in place; your "
+                            "name/description/tags preserved)"
+                            % (old_fn, match_fn))
+                  else:
+                      still_unmatched.append(e)
+
+              # Truly removed entries (asset gone, no rename match).
+              for e in still_unmatched:
+                  removed += 1
+                  label = e.get("id") or e.get("name", "?")
+                  fn = str(e.get("link", "")).rsplit("/", 1)[-1]
+                  print("removed %s (asset %s no longer in release)"
+                        % (label, fn))
+
+              # Truly new assets (no existing entry, no rename match).
+              for fn in sorted(remaining):
+                  zp = remaining[fn]
+                  cat, ptype, name, ver, id_, vf, pf = derive_from(
+                      fn, zp, tag)
                   link = build_link(repo, tag, fn)
                   kept.append(new_entry(id_, cat, name, ver, today, link,
                                         sha256_of(zp),
@@ -430,6 +532,7 @@ jobs:
                   added += 1
                   print("added %s (%s%s) from %s"
                         % (id_, cat, "/" + ptype if ptype else "", fn))
+
               save_catalog(kept, wrapper)
               print("reconcile %s: +%d added, %d refreshed, %d removed "
                     "-> %d total"
