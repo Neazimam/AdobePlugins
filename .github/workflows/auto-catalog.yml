@@ -263,6 +263,17 @@ jobs:
               s = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
               return s or "entry"
 
+          def clean_name_token(name):
+              """Strip a trailing .core / .aeplugin token left over in the
+              display name by an older workflow version (which didn't strip
+              it). Returns the cleaned name, or None if there was no
+              trailing token to strip (so callers can tell)."""
+              m = re.match(r"^(.+?)[._-](core|aeplugin)$", str(name),
+                           re.IGNORECASE)
+              if m:
+                  return display_name(m.group(1))
+              return None
+
           def base_key(text):
               """Normalize a package name for comparison: lowercase, drop
               the version suffix AND any core/aeplugin token, drop all
@@ -463,6 +474,13 @@ jobs:
                       if pf and e.get("plugin_type") != ptype:
                           e["plugin_type"] = ptype
                           changed = True
+                      # Clean up a stale '.core' / '.aeplugin' suffix that
+                      # an older workflow version baked into the name.
+                      cleaned = clean_name_token(e.get("name", ""))
+                      if (cleaned is not None
+                              and e.get("name") != cleaned):
+                          e["name"] = cleaned
+                          changed = True
                       if changed:
                           e["last_updated"] = today
                           refreshed += 1
@@ -502,6 +520,9 @@ jobs:
                           e["version"] = ver
                       if pf and e.get("plugin_type") != ptype:
                           e["plugin_type"] = ptype
+                      cleaned = clean_name_token(e.get("name", ""))
+                      if cleaned is not None and e.get("name") != cleaned:
+                          e["name"] = cleaned
                       kept.append(e)
                       matched.add(match_fn)
                       del remaining[match_fn]
