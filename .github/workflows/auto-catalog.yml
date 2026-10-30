@@ -43,7 +43,11 @@
 #   4. ~30 seconds later this workflow updates After-Effect-HUB.json for you
 #      (commit author: github-actions[bot]). EAGLE -> Refresh shows it.
 #   Delete or unpublish a release -> its catalog entries are removed
-#      the same way. Still zero manual JSON edits, in either direction.
+#      the same way. Editing a release (add / remove / re-upload an asset)
+#      reconciles the catalog: new assets appear, removed ones vanish,
+#      re-uploaded ones get fresh sha/size - your hand-edited name /
+#      version / category / description / tags are always preserved.
+#      Still zero manual JSON edits, in either direction.
 #
 # HOW THE TYPE IS DETECTED (for every .zip in the release)
 # --------------------------------------------------------
@@ -83,7 +87,7 @@ name: Auto catalog
 
 on:
   release:
-    types: [published, unpublished, deleted]
+    types: [published, edited, unpublished, deleted]
 
 # contents:read is enough for the GITHUB_TOKEN to download AdobePlugins'
 # own releases. Writing catalog.json to After-Effect-HUB goes through the
@@ -107,7 +111,7 @@ jobs:
           token: ${{ secrets.CATALOG_TOKEN }}
 
       - name: Download the release .zip assets
-        if: ${{ github.event.action == 'published' }}
+        if: ${{ github.event.action == 'published' || github.event.action == 'edited' }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -299,14 +303,128 @@ jobs:
                       kept.append(e)
               return kept, removed
 
-          def main():
-              items, wrapper = load_catalog()
+          def build_link(repo, tag, fname):
+              return ("https://github.com/" + repo + "/releases/download/"
+                      + url_quote(tag, safe="") + "/"
+                      + url_quote(fname, safe=""))
 
-              # Release deleted or unpublished -> drop every entry that
-              # still points at this release's tag. Entries already
-              # bumped to a newer release keep pointing at the newer
-              # tag, so they survive - correct: the package still ships.
+          def derive_from(fname, zip_path, tag):
+              """Derive category/name/version/id for a new asset. Returns
+              (category, ptype, name, version, id_, version_found).
+              version_found is False when version fell back to 1.0.0, so
+              callers can preserve a hand-edited version on refresh."""
+              stem = re.sub(r"\.[A-Za-z0-9]{1,5}$", "", fname)
+              tcat, tptype, trest = split_prefix(tag)
+              tname, tver = split_version(trest)
+              tag_named = bool(tname) and (tver is not None
+                                           or tcat is not None)
+              fn_name, fn_ver = split_version(stem)
+              if tag_named:
+                  name = display_name(tname)
+                  version = tver or fn_ver or "1.0.0"
+              else:
+                  name = display_name(fn_name or stem)
+                  version = fn_ver or tver or "1.0.0"
+              version_found = (tver is not None) or (fn_ver is not None)
+              category = tcat or sniff(zip_path)
+              ptype = tptype
+              if category is None:
+                  print("note: %s: type not detected from contents - "
+                        "defaulting to plugin (use a tag prefix like "
+                        "plugin-... to force one)" % fname)
+                  category = "plugin"
+              if category == "plugin" and not ptype:
+                  ptype = "aeplugin"
+              return (category, ptype, name, version, make_id(name),
+                      version_found)
+
+          def reconcile(asset_dir, tag, repo, today):
+              """Reconcile the catalog against the FULL asset list of one
+              release. For every entry whose link points at <tag>: if its
+              asset is still in the release, refresh sha/size/link (and
+              version only when one was parsed from the name), preserving
+              hand-edited name/category/description/tags; if the asset is
+              gone, drop the entry. Assets with no matching entry are
+              added. An empty asset download aborts without touching the
+              catalog (guards against a failed download wiping entries)."""
+              assets = {}
+              for p in sorted(glob.glob(os.path.join(asset_dir, "*"))):
+                  if p.lower().endswith(".zip"):
+                      assets[os.path.basename(p)] = p
+              if not assets:
+                  raise SystemExit(
+                      "error: no .zip assets downloaded for release %s - "
+                      "leaving the catalog untouched (this guards against "
+                      "a failed download wiping entries)" % tag)
+              items, wrapper = load_catalog()
+              raw_pfx = "/releases/download/" + tag + "/"
+              quot_pfx = ("/releases/download/"
+                          + url_quote(tag, safe="") + "/")
+              kept = []
+              matched = set()
+              added = refreshed = removed = 0
+              for e in items:
+                  if not isinstance(e, dict):
+                      kept.append(e)
+                      continue
+                  link = str(e.get("link", ""))
+                  if raw_pfx not in link and quot_pfx not in link:
+                      kept.append(e)
+                      continue
+                  fn = link.rsplit("/", 1)[-1]
+                  label = e.get("id") or e.get("name", "?")
+                  if fn and fn in assets:
+                      zp = assets[fn]
+                      new_sha = sha256_of(zp)
+                      new_size = os.path.getsize(zp)
+                      new_link = build_link(repo, tag, fn)
+                      changed = False
+                      if (e.get("sha256") != new_sha
+                              or e.get("size_bytes") != new_size
+                              or e.get("link") != new_link):
+                          e["sha256"] = new_sha
+                          e["size_bytes"] = new_size
+                          e["link"] = new_link
+                          changed = True
+                      cat, ptype, name, ver, id_, vf = derive_from(
+                          fn, zp, tag)
+                      if vf and e.get("version") != ver:
+                          e["version"] = ver
+                          changed = True
+                      if changed:
+                          e["last_updated"] = today
+                          refreshed += 1
+                          print("refreshed %s (asset %s still in release)"
+                                % (label, fn))
+                      else:
+                          print("unchanged %s (asset %s same content)"
+                                % (label, fn))
+                      kept.append(e)
+                      matched.add(fn)
+                  else:
+                      removed += 1
+                      print("removed %s (asset %s no longer in release)"
+                            % (label, fn))
+              for fn in sorted(assets):
+                  if fn in matched:
+                      continue
+                  zp = assets[fn]
+                  cat, ptype, name, ver, id_, vf = derive_from(fn, zp, tag)
+                  link = build_link(repo, tag, fn)
+                  kept.append(new_entry(id_, cat, name, ver, today, link,
+                                        sha256_of(zp),
+                                        os.path.getsize(zp), ptype))
+                  added += 1
+                  print("added %s (%s%s) from %s"
+                        % (id_, cat, "/" + ptype if ptype else "", fn))
+              save_catalog(kept, wrapper)
+              print("reconcile %s: +%d added, %d refreshed, %d removed "
+                    "-> %d total"
+                    % (tag, added, refreshed, removed, len(kept)))
+
+          def main():
               if ACTION in ("unpublished", "deleted"):
+                  items, wrapper = load_catalog()
                   kept, removed = remove_for_tag(items, TAG)
                   if not removed:
                       print("release %s: no catalog entries point at "
@@ -320,77 +438,10 @@ jobs:
                         % (CATALOG, len(kept),
                            "y" if len(kept) == 1 else "ies"))
                   return
-
-              zips = sorted(p for p in glob.glob(os.path.join(ASSET_DIR, "*"))
-                            if p.lower().endswith(".zip"))
-              if not zips:
-                  raise SystemExit(
-                      "error: no .zip asset in this release - attach the "
-                      "package as a .zip, then re-run the workflow")
-
-              # A tag only claims the entry name when it clearly intends
-              # to: it carries a category prefix ("plugin-Chromabba") or
-              # a version ("Chromabba-1.4.3"). Any other tag ("release",
-              # "first-build") stays neutral so each zip's own filename
-              # decides name+version - this keeps multi-zip releases and
-              # casual tag names from hijacking the entries.
-              tcat, tptype, trest = split_prefix(TAG)
-              tname, tver = split_version(trest)
-              tag_named = bool(tname) and (tver is not None
-                                           or tcat is not None)
-
-              for zp in zips:
-                  fname = os.path.basename(zp)
-                  stem = re.sub(r"\.[A-Za-z0-9]{1,5}$", "", fname)
-                  fn_name, fn_ver = split_version(stem)
-                  if tag_named:
-                      name = display_name(tname)
-                      version = tver or fn_ver or "1.0.0"
-                  else:
-                      name = display_name(fn_name or stem)
-                      version = fn_ver or tver or "1.0.0"
-                  category = tcat or sniff(zp)
-                  ptype = tptype
-                  if category is None:
-                      print("note: %s: type not detected from contents - "
-                            "defaulting to plugin (use a tag prefix like "
-                            "plugin-... to force one)" % fname)
-                      category = "plugin"
-                  if category == "plugin" and not ptype:
-                      ptype = "aeplugin"
-                  id_ = make_id(name)
-                  link = ("https://github.com/" + REPO +
-                          "/releases/download/" + url_quote(TAG, safe="") +
-                          "/" + url_quote(fname, safe=""))
-                  sha = sha256_of(zp)
-                  size = os.path.getsize(zp)
-                  today = datetime.date.today().isoformat()
-                  print("detected %s -> %s%s id=%s v%s" % (
-                      fname, category, "/" + ptype if ptype else "",
-                      id_, version))
-
-                  existing, how = find_entry(items, id_, base_key(stem),
-                                             category)
-                  if existing is not None:
-                      old = existing.get("version", "?")
-                      existing["version"] = version
-                      existing["last_updated"] = today
-                      existing["sha256"] = sha
-                      existing["size_bytes"] = size
-                      existing["link"] = link
-                      print("bumped %s: %s -> %s (matched by %s; your "
-                            "name/description/category/tags are preserved)"
-                            % (existing.get("id", id_), old, version, how))
-                  else:
-                      items.append(new_entry(
-                          id_, category, name, version, today, link, sha,
-                          size, ptype))
-                      print("added  %s %s" % (id_, version))
-
-              save_catalog(items, wrapper)
-              print("wrote %s (%d entr%s)"
-                    % (CATALOG, len(items),
-                       "y" if len(items) == 1 else "ies"))
+              # published or edited -> reconcile against this release's
+              # full asset list (handles add, remove, and re-upload).
+              reconcile(ASSET_DIR, TAG, REPO,
+                        datetime.date.today().isoformat())
 
           main()
           PYEOF
