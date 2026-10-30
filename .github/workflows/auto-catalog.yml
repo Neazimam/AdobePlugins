@@ -192,9 +192,10 @@ jobs:
           ]
 
           # Trailing version in a tag / filename:
-          # "Chromabba-1.4.3", "v2.0", "Suite 16"
+          # "Chromabba-1.4.3", "v2.0", "Suite 16", "Cyclops.4.0.0"
+          # (dots, hyphens, underscores, spaces all work as separators)
           VER_RE = re.compile(
-              r"(?:^|[-_ ])(?:v|ver-?)?(\d+(?:\.\d+)*)\s*$", re.IGNORECASE)
+              r"(?:^|[-_. ])(?:v|ver-?)?(\d+(?:\.\d+)*)\s*$", re.IGNORECASE)
 
           def sha256_of(path):
               h = hashlib.sha256()
@@ -208,13 +209,39 @@ jobs:
                   print("note: catalog.json not found - creating a new one")
                   return [], None
               with open(CATALOG, "r", encoding="utf-8") as f:
-                  data = json.load(f)
+                  text = f.read()
+              data = _parse_lenient(text)
               if isinstance(data, list):
                   return data, None
               if isinstance(data, dict) and isinstance(data.get("items"), list):
                   return data["items"], data
               raise SystemExit(
                   "error: catalog.json is neither [...] nor {'items': [...]}")
+
+          def _parse_lenient(text):
+              """Parse JSON, auto-repairing common hand-edit errors
+              (missing comma between two objects, or between two string
+              keys). Reports the repair so you know your hand-edit was
+              fixed - you don't have to be a JSON expert."""
+              try:
+                  return json.loads(text)
+              except json.JSONDecodeError:
+                  pass
+              repaired = text
+              repaired = re.sub(r"}\s*\n\s*{", "},\n  {", repaired)
+              repaired = re.sub(r'"\s*\n\s*"', '",\n  "', repaired)
+              try:
+                  data = json.loads(repaired)
+                  print("note: catalog had a JSON syntax error "
+                        "(likely a missing comma from a hand-edit); "
+                        "auto-repaired and continued.")
+                  return data
+              except json.JSONDecodeError as e:
+                  raise SystemExit(
+                      "error: After-Effect-HUB.json has a JSON syntax "
+                      "error I could not auto-repair: %s (line %d). "
+                      "Open the file, find that line, and add the "
+                      "missing comma or quote." % (e, e.lineno))
 
           def save_catalog(items, wrapper):
               out = items if wrapper is None else {**wrapper, "items": items}
@@ -279,11 +306,82 @@ jobs:
               the version suffix AND any core/aeplugin token, drop all
               non-alphanumerics. "Bionic Blur 1.2", "bionic-blur-1.0",
               and "Bionic.core-1.0" all -> "bionicblur"."""
-              stem = re.sub(r"\.[A-Za-z0-9]{1,5}$", "", str(text))
+              stem = re.sub(r"\.(zip|zxp|aex|jsx|jsxbin|json)$", "", str(text),
+                            flags=re.IGNORECASE)
               stem = re.sub(r"(?:^|[-_.])(?:core|aeplugin)(?:[-_.]|$)", " ",
                             stem, flags=re.IGNORECASE)
               name, _ = split_version(stem)
               return re.sub(r"[^a-z0-9]+", "", (name or stem).lower())
+
+          def version_key(v):
+              """Parse a version string into a list of ints for sorting.
+              '1.4.3' -> [1,4,3]; '2' -> [2]; '2026' -> [2026].
+              Non-numeric segments -> 0. Longer = newer when prefix equal."""
+              parts = []
+              for p in str(v).split("."):
+                  m = re.match(r"^(\d+)", p)
+                  parts.append(int(m.group(1)) if m else 0)
+              return parts
+
+          def link_version(entry):
+              """Extract the version from the entry's release-link
+              filename (the source of truth - more reliable than the
+              version field, which may be hand-set or stale from an
+              older workflow version)."""
+              fn = str(entry.get("link", "")).rsplit("/", 1)[-1]
+              stem = re.sub(r"\.[A-Za-z0-9]{1,5}$", "", fn)
+              _, ver = split_version(stem)
+              return ver or entry.get("version", "0") or "0"
+
+          def dedupe(items):
+              """Remove same-package duplicates: group entries by
+              (category, normalized name) and keep only the NEWEST
+              version in each group (comparing versions parsed from the
+              release-link filenames). Hand-edited description/tags from
+              a removed old entry are merged onto the keeper if it lacks
+              them. Entries with different categories are NOT merged
+              (same name, different type = different package)."""
+              groups = {}
+              order = []
+              non_dicts = []
+              for e in items:
+                  if not isinstance(e, dict):
+                      non_dicts.append(e)
+                      continue
+                  key = (e.get("category", ""),
+                         base_key(e.get("name", "")))
+                  if key not in groups:
+                      groups[key] = []
+                      order.append(key)
+                  groups[key].append(e)
+              deduped = list(non_dicts)
+              removed = 0
+              for key in order:
+                  group = groups[key]
+                  if len(group) <= 1:
+                      deduped.extend(group)
+                      continue
+                  keeper = max(
+                      group,
+                      key=lambda e: version_key(link_version(e)))
+                  for e in group:
+                      if e is keeper:
+                          continue
+                      # merge hand-edits from the old entry onto keeper
+                      if (not keeper.get("description")
+                              and e.get("description")):
+                          keeper["description"] = e["description"]
+                      if not keeper.get("tags") and e.get("tags"):
+                          keeper["tags"] = e["tags"]
+                      removed += 1
+                      print("deduped: removed %s %s (same package as "
+                            "%s; kept %s)"
+                            % (e.get("name", "?"),
+                               link_version(e),
+                               keeper.get("name", "?"),
+                               link_version(keeper)))
+                  deduped.append(keeper)
+              return deduped, removed
 
           def find_entry(items, id_, base, category):
               # 1) exact id
@@ -554,10 +652,13 @@ jobs:
                   print("added %s (%s%s) from %s"
                         % (id_, cat, "/" + ptype if ptype else "", fn))
 
+              kept, dedup_removed = dedupe(kept)
+              removed += dedup_removed
               save_catalog(kept, wrapper)
               print("reconcile %s: +%d added, %d refreshed, %d removed "
-                    "-> %d total"
-                    % (tag, added, refreshed, removed, len(kept)))
+                    "(%d deduped) -> %d total"
+                    % (tag, added, refreshed, removed, dedup_removed,
+                       len(kept)))
 
           def main():
               if ACTION in ("unpublished", "deleted"):
