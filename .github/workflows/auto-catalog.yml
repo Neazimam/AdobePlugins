@@ -4,7 +4,8 @@
 # --------------------------------
 # You have TWO repos:
 #   - AdobePlugins      : holds the releases (the .zip assets live here)
-#   - After-Effect-HUB  : holds catalog.json (what EAGLE fetches)
+#   - After-Effect-HUB  : holds After-Effect-HUB.json (the catalog EAGLE
+#                         fetches - matches fetch.cpp's primary_url)
 #
 # This workflow file goes in the ASSET repo (AdobePlugins), because that is
 # the repo whose `release` events must trigger it. A workflow placed in
@@ -18,25 +19,28 @@
 #      New repository secret -> Name: CATALOG_TOKEN -> paste the PAT.
 #   3. (Optional) AdobePlugins -> Variables -> New variable ->
 #      Name: CATALOG_REPO -> Value: <owner>/After-Effect-HUB. Skip this if
-#      your GitHub username is "dj" (the default below already matches).
+#      your GitHub username is "Neazimam" (the default below matches).
+#      The catalog FILENAME defaults to "After-Effect-HUB.json" (matching
+#      your repo + fetch.cpp); override only via a CATALOG_FILE variable
+#      if it ever differs.
 #   4. Add this file at  .github/workflows/auto-catalog.yml  in AdobePlugins.
 #   5. Publish a test release in AdobePlugins; ~30 s later the bot commits
-#      catalog.json in After-Effect-HUB.
+#      After-Effect-HUB.json in After-Effect-HUB.
 #
 # The built-in GITHUB_TOKEN downloads AdobePlugins' own releases; the PAT
 # is only used to check out and push to After-Effect-HUB.
 #
-# Single-repo alternative: if you ever merge the repos (move catalog.json
-# into AdobePlugins), delete the `repository:` and `token:` lines from the
-# checkout step, set `permissions: contents: write`, and you can drop the
-# PAT entirely.
+# Single-repo alternative: if you ever merge the repos (move
+# After-Effect-HUB.json into AdobePlugins), delete the `repository:` and
+# `token:` lines from the checkout step, set `permissions: contents: write`,
+# and you can drop the PAT entirely.
 #
 # FROM THEN ON, PUBLISHING = ZERO COMMANDS
 # ----------------------------------------
 #   1. GitHub -> Releases -> "Draft a new release"
 #   2. Tag it, e.g.  v1.4.3   (conventions below)
 #   3. Attach your .zip file(s), click "Publish release"
-#   4. ~30 seconds later this workflow updates catalog.json for you
+#   4. ~30 seconds later this workflow updates After-Effect-HUB.json for you
 #      (commit author: github-actions[bot]). EAGLE -> Refresh shows it.
 #   Delete or unpublish a release -> its catalog entries are removed
 #      the same way. Still zero manual JSON edits, in either direction.
@@ -96,8 +100,8 @@ jobs:
         with:
           # The catalog lives in a DIFFERENT repo than the releases.
           # CATALOG_REPO variable = "<owner>/After-Effect-HUB" (set it in
-          # AdobePlugins -> Variables); defaults to dj/After-Effect-HUB.
-          repository: ${{ vars.CATALOG_REPO || 'dj/After-Effect-HUB' }}
+          # AdobePlugins -> Variables); defaults to Neazimam/After-Effect-HUB.
+          repository: ${{ vars.CATALOG_REPO || 'Neazimam/After-Effect-HUB' }}
           # PAT with Contents:write on After-Effect-HUB (secret CATALOG_TOKEN
           # in AdobePlugins). Omit repository+token if you merge the repos.
           token: ${{ secrets.CATALOG_TOKEN }}
@@ -119,6 +123,7 @@ jobs:
           RELEASE_ACTION: ${{ github.event.action }}
           RELEASE_TAG: ${{ github.event.release.tag_name }}
           RELEASE_REPO: ${{ github.repository }}
+          CATALOG_FILE: ${{ vars.CATALOG_FILE || 'After-Effect-HUB.json' }}
         run: |
           cat > "$RUNNER_TEMP/auto_catalog.py" <<'PYEOF'
           import datetime
@@ -135,7 +140,8 @@ jobs:
           ACTION = os.environ.get("RELEASE_ACTION", "published").strip()
           TAG = os.environ.get("RELEASE_TAG", "").strip()
           REPO = os.environ.get("RELEASE_REPO", "").strip()
-          CATALOG = "catalog.json"
+          CATALOG = (os.environ.get("CATALOG_FILE", "").strip()
+                    or "After-Effect-HUB.json")
 
           # Canonical key order matches src/catalog/fetch.h struct order.
           ENTRY_KEY_ORDER = [
@@ -394,10 +400,11 @@ jobs:
         env:
           RELEASE_ACTION: ${{ github.event.action }}
           RELEASE_TAG: ${{ github.event.release.tag_name }}
+          CATALOG_FILE: ${{ vars.CATALOG_FILE || 'After-Effect-HUB.json' }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add catalog.json
+          git add "$CATALOG_FILE"
           if git diff --cached --quiet; then
             echo "catalog.json unchanged - nothing to commit"
           else
