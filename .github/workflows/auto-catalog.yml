@@ -27,6 +27,12 @@
 #   5. Publish a test release in AdobePlugins; ~30 s later the bot commits
 #      After-Effect-HUB.json in After-Effect-HUB.
 #
+# Manual catch-up / debugging: AdobePlugins -> Actions tab -> "Auto
+# catalog" -> "Run workflow" -> enter the release tag (e.g. Plugins) ->
+# Run. Runs the same reconcile on demand - handy for the first deploy or
+# when a release event didn't fire. Watch the live log to see exactly
+# what happened.
+#
 # The built-in GITHUB_TOKEN downloads AdobePlugins' own releases; the PAT
 # is only used to check out and push to After-Effect-HUB.
 #
@@ -88,6 +94,12 @@ name: Auto catalog
 on:
   release:
     types: [published, edited, unpublished, deleted]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to reconcile (e.g. Plugins) - used when you click "Run workflow" manually'
+        required: true
+        type: string
 
 # contents:read is enough for the GITHUB_TOKEN to download AdobePlugins'
 # own releases. Writing catalog.json to After-Effect-HUB goes through the
@@ -111,12 +123,13 @@ jobs:
           token: ${{ secrets.CATALOG_TOKEN }}
 
       - name: Download the release .zip assets
-        if: ${{ github.event.action == 'published' || github.event.action == 'edited' }}
+        if: ${{ github.event_name == 'workflow_dispatch' || github.event.action == 'published' || github.event.action == 'edited' }}
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
         run: |
           mkdir -p "$RUNNER_TEMP/assets"
-          gh release download "$GITHUB_REF_NAME" \
+          gh release download "$RELEASE_TAG" \
             --repo "$GITHUB_REPOSITORY" \
             --pattern '*.zip' --pattern '*.ZIP' \
             --clobber --dir "$RUNNER_TEMP/assets"
@@ -124,8 +137,8 @@ jobs:
 
       - name: Add, update, or remove catalog entries
         env:
-          RELEASE_ACTION: ${{ github.event.action }}
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_ACTION: ${{ github.event.action || 'edited' }}
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
           RELEASE_REPO: ${{ github.repository }}
           CATALOG_FILE: ${{ vars.CATALOG_FILE || 'After-Effect-HUB.json' }}
         run: |
@@ -449,8 +462,8 @@ jobs:
 
       - name: Commit and push to the catalog repo
         env:
-          RELEASE_ACTION: ${{ github.event.action }}
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_ACTION: ${{ github.event.action || 'edited' }}
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
           CATALOG_FILE: ${{ vars.CATALOG_FILE || 'After-Effect-HUB.json' }}
         run: |
           git config user.name "github-actions[bot]"
