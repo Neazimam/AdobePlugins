@@ -1,0 +1,520 @@
+
+# EAGLE auto-catalog - MANUAL trigger only.
+# You upload a zip to the Plugins release, then click:
+#   Actions -> "Auto catalog" -> "Run workflow" -> type "Plugins" -> Run
+# ~30 s later the entry appears in After-Effect-HUB.json with correct
+# name, version, plugin_type (.core -> core/MediaCore), category sniffed
+# from the zip contents, sha256 + size. Duplicates auto-merge (keep newest).
+# No automatic triggers -> no run pile-ups, no stuck queue.
+
+name: Auto catalog
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to reconcile (e.g. Plugins) - type it when you click "Run workflow"'
+        required: true
+        type: string
+
+# contents:read is enough for the GITHUB_TOKEN to download AdobePlugins'
+# own releases. Writing catalog.json to After-Effect-HUB goes through the
+# PAT (CATALOG_TOKEN), which this permissions key does not scope.
+permissions:
+  contents: read
+
+# Only ONE run at a time. A double-click auto-cancels the previous run.
+# A hung run dies after 15 min. So you never get a blocked queue.
+concurrency:
+  group: auto-catalog
+  cancel-in-progress: true
+
+jobs:
+  auto-catalog:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out the catalog repo (After-Effect-HUB)
+        uses: actions/checkout@v4
+        with:
+          # CATALOG_REPO variable = "<owner>/After-Effect-HUB" (set it in
+          # AdobePlugins -> Variables); defaults to Neazimam/After-Effect-HUB.
+          repository: ${{ vars.CATALOG_REPO || 'Neazimam/After-Effect-HUB' }}
+          # PAT with Contents:write on After-Effect-HUB (secret CATALOG_TOKEN).
+          token: ${{ secrets.CATALOG_TOKEN }}
+
+      - name: Download the release .zip assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag || 'Plugins' }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/assets"
+          gh release download "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern '*.zip' --pattern '*.ZIP' \
+            --clobber --dir "$RUNNER_TEMP/assets"
+          ls -la "$RUNNER_TEMP/assets"
+
+      - name: Add, update, or remove catalog entries
+        env:
+          RELEASE_ACTION: ${{ github.event.action || 'edited' }}
+          RELEASE_TAG: ${{ inputs.tag || 'Plugins' }}
+          RELEASE_REPO: ${{ github.repository }}
+          CATALOG_FILE: ${{ vars.CATALOG_FILE || 'After-Effect-HUB.json' }}
+        run: |
+          cat > "$RUNNER_TEMP/auto_catalog.py" <<'PYEOF'
+          import datetime
+          import glob
+          import hashlib
+          import json
+          import os
+          import re
+          import sys
+          import zipfile
+          from urllib.parse import quote as url_quote
+
+          ASSET_DIR = sys.argv[1]
+          ACTION = os.environ.get("RELEASE_ACTION", "published").strip()
+          TAG = os.environ.get("RELEASE_TAG", "").strip()
+          REPO = os.environ.get("RELEASE_REPO", "").strip()
+          CATALOG = (os.environ.get("CATALOG_FILE", "").strip()
+                    or "After-Effect-HUB.json")
+
+          ENTRY_KEY_ORDER = [
+              "id", "category", "name", "version", "last_updated",
+              "link", "sha256", "size_bytes", "description", "tags",
+              "plugin_type",
+          ]
+
+          TAG_PREFIXES = [
+              ("extension-", "extension", None),
+              ("aeplugin-", "plugin", "aeplugin"),
+              ("plugin-", "plugin", "aeplugin"),
+              ("script-", "script", None),
+              ("core-", "plugin", "core"),
+          ]
+
+          VER_RE = re.compile(
+              r"(?:^|[-_. ])(?:v|ver-?)?(\d+(?:\.\d+)*)\s*$", re.IGNORECASE)
+
+          def sha256_of(path):
+              h = hashlib.sha256()
+              with open(path, "rb") as f:
+                  for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          def load_catalog():
+              if not os.path.exists(CATALOG):
+                  print("note: catalog.json not found - creating a new one")
+                  return [], None
+              with open(CATALOG, "r", encoding="utf-8") as f:
+                  text = f.read()
+              data = _parse_lenient(text)
+              if isinstance(data, list):
+                  return data, None
+              if isinstance(data, dict) and isinstance(data.get("items"), list):
+                  return data["items"], data
+              raise SystemExit(
+                  "error: catalog.json is neither [...] nor {'items': [...]}")
+
+          def _parse_lenient(text):
+              """Parse JSON, auto-repairing common hand-edit errors
+              (missing comma between two objects / between string keys)."""
+              try:
+                  return json.loads(text)
+              except json.JSONDecodeError:
+                  pass
+              repaired = text
+              repaired = re.sub(r"}\s*\n\s*{", "},\n  {", repaired)
+              repaired = re.sub(r'"\s*\n\s*"', '",\n  "', repaired)
+              try:
+                  data = json.loads(repaired)
+                  print("note: catalog had a JSON syntax error "
+                        "(likely a missing comma from a hand-edit); "
+                        "auto-repaired and continued.")
+                  return data
+              except json.JSONDecodeError as e:
+                  raise SystemExit(
+                      "error: After-Effect-HUB.json has a JSON syntax "
+                      "error I could not auto-repair: %s (line %d). "
+                      "Open the file, find that line, and add the "
+                      "missing comma or quote." % (e, e.lineno))
+
+          def save_catalog(items, wrapper):
+              out = items if wrapper is None else {**wrapper, "items": items}
+              with open(CATALOG, "w", encoding="utf-8") as f:
+                  f.write(json.dumps(out, indent=2, ensure_ascii=False) + "\n")
+
+          def sniff(zip_path):
+              """Look INSIDE the zip: CSXS/manifest.xml -> extension,
+              .aex -> plugin, .jsx/.jsxbin -> script. CSXS checked first."""
+              try:
+                  with zipfile.ZipFile(zip_path) as z:
+                      names = [n.lower().replace("\\", "/")
+                               for n in z.namelist() if not n.endswith("/")]
+              except zipfile.BadZipFile:
+                  return None
+              if any(n.endswith("csxs/manifest.xml") for n in names):
+                  return "extension"
+              if any(n.endswith(".aex") for n in names):
+                  return "plugin"
+              if any(n.endswith(".jsx") or n.endswith(".jsxbin")
+                     for n in names):
+                  return "script"
+              return None
+
+          def split_prefix(text):
+              t = text.strip()
+              for pfx, cat, ptype in TAG_PREFIXES:
+                  if t.lower().startswith(pfx):
+                      return cat, ptype, t[len(pfx):]
+              return None, None, t
+
+          def split_version(text):
+              m = VER_RE.search(text)
+              if not m:
+                  return text.strip(" -_"), None
+              return text[:m.start()].strip(" -_"), m.group(1)
+
+          def display_name(raw):
+              return re.sub(r"[-_]+", " ", raw).strip()
+
+          def make_id(name):
+              s = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+              return s or "entry"
+
+          def clean_name_token(name):
+              """Strip a trailing .core/.aeplugin suffix left by an older
+              workflow version. Returns cleaned name, or None if no suffix."""
+              m = re.match(r"^(.+?)[._-](core|aeplugin)$", str(name),
+                           re.IGNORECASE)
+              if m:
+                  return display_name(m.group(1))
+              return None
+
+          def base_key(text):
+              """Normalize a name for comparison: lowercase, drop version
+              suffix + core/aeplugin token, drop non-alphanumerics."""
+              stem = re.sub(r"\.(zip|zxp|aex|jsx|jsxbin|json)$", "", str(text),
+                            flags=re.IGNORECASE)
+              stem = re.sub(r"(?:^|[-_.])(?:core|aeplugin)(?:[-_.]|$)", " ",
+                            stem, flags=re.IGNORECASE)
+              name, _ = split_version(stem)
+              return re.sub(r"[^a-z0-9]+", "", (name or stem).lower())
+
+          def version_key(v):
+              parts = []
+              for p in str(v).split("."):
+                  m = re.match(r"^(\d+)", p)
+                  parts.append(int(m.group(1)) if m else 0)
+              return parts
+
+          def link_version(entry):
+              fn = str(entry.get("link", "")).rsplit("/", 1)[-1]
+              stem = re.sub(r"\.[A-Za-z0-9]{1,5}$", "", fn)
+              _, ver = split_version(stem)
+              return ver or entry.get("version", "0") or "0"
+
+          def dedupe(items):
+              """Same name + same category, multiple versions -> keep newest
+              (by link-filename version), merge hand-edits. Different
+              category = different package, both kept."""
+              groups = {}
+              order = []
+              non_dicts = []
+              for e in items:
+                  if not isinstance(e, dict):
+                      non_dicts.append(e)
+                      continue
+                  key = (e.get("category", ""),
+                         base_key(e.get("name", "")))
+                  if key not in groups:
+                      groups[key] = []
+                      order.append(key)
+                  groups[key].append(e)
+              deduped = list(non_dicts)
+              removed = 0
+              for key in order:
+                  group = groups[key]
+                  if len(group) <= 1:
+                      deduped.extend(group)
+                      continue
+                  keeper = max(
+                      group,
+                      key=lambda e: version_key(link_version(e)))
+                  for e in group:
+                      if e is keeper:
+                          continue
+                      if (not keeper.get("description")
+                              and e.get("description")):
+                          keeper["description"] = e["description"]
+                      if not keeper.get("tags") and e.get("tags"):
+                          keeper["tags"] = e["tags"]
+                      removed += 1
+                      print("deduped: removed %s %s (same package as "
+                            "%s; kept %s)"
+                            % (e.get("name", "?"),
+                               link_version(e),
+                               keeper.get("name", "?"),
+                               link_version(keeper)))
+                  deduped.append(keeper)
+              return deduped, removed
+
+          def new_entry(id_, category, name, version, today, link, sha,
+                        size, ptype):
+              fields = {
+                  "id": id_, "category": category, "name": name,
+                  "version": version, "last_updated": today, "link": link,
+                  "sha256": sha, "size_bytes": size,
+                  "description": "", "tags": [], "plugin_type": ptype,
+              }
+              out = {}
+              for k in ENTRY_KEY_ORDER:
+                  v = fields[k]
+                  if v in (None, "", [], {}):
+                      continue
+                  out[k] = v
+              return out
+
+          def build_link(repo, tag, fname):
+              return ("https://github.com/" + repo + "/releases/download/"
+                      + url_quote(tag, safe="") + "/"
+                      + url_quote(fname, safe=""))
+
+          def derive_from(fname, zip_path, tag):
+              """Derive category/name/version/id/plugin_type. Returns
+              (category, ptype, name, version, id_, version_found,
+              ptype_found). ptype_found is True only when the plugin
+              subtype came from a signal (tag prefix or .core/.aeplugin
+              filename token) - callers use it to avoid overwriting a
+              hand-set plugin_type with the default aeplugin."""
+              stem = re.sub(r"\.[A-Za-z0-9]{1,5}$", "", fname)
+              tcat, tptype, trest = split_prefix(tag)
+              tname, tver = split_version(trest)
+              tag_named = bool(tname) and (tver is not None
+                                           or tcat is not None)
+              stem_name = re.sub(
+                  r"(?:^|[-_.])(?:core|aeplugin)(?:[-_.]|$)", " ", stem,
+                  flags=re.IGNORECASE).strip(" -_.") or stem
+              fn_name, fn_ver = split_version(stem_name)
+              if tag_named:
+                  name = display_name(tname)
+                  version = tver or fn_ver or "1.0.0"
+              else:
+                  name = display_name(fn_name or stem_name)
+                  version = fn_ver or tver or "1.0.0"
+              version_found = (tver is not None) or (fn_ver is not None)
+              category = tcat or sniff(zip_path)
+              ptype = tptype
+              ptype_found = tptype is not None
+              if category is None:
+                  print("note: %s: type not detected from contents - "
+                        "defaulting to plugin (use a tag prefix like "
+                        "plugin-... to force one)" % fname)
+                  category = "plugin"
+              if category == "plugin" and not ptype:
+                  sl = stem.lower()
+                  if re.search(r"(?:^|[-_.])core(?:[-_.]|$)", sl):
+                      ptype = "core"
+                      ptype_found = True
+                  elif re.search(r"(?:^|[-_.])aeplugin(?:[-_.]|$)", sl):
+                      ptype = "aeplugin"
+                      ptype_found = True
+              if category == "plugin" and not ptype:
+                  ptype = "aeplugin"
+              return (category, ptype, name, version, make_id(name),
+                      version_found, ptype_found)
+
+          def reconcile(asset_dir, tag, repo, today):
+              """Reconcile the catalog against the release's full asset list.
+              Pass 1: exact filename match -> refresh sha/size/link/version/
+              plugin_type(when signaled) + strip stale .core suffix; preserve
+              hand-edited name/description/tags.
+              Pass 2: base-key match for renamed assets -> refactor in place.
+              Then dedupe: same name+category -> keep newest. Assets with no
+              match are added; entries with no match are removed. An empty
+              download aborts without touching the catalog."""
+              assets = {}
+              for p in sorted(glob.glob(os.path.join(asset_dir, "*"))):
+                  if p.lower().endswith(".zip"):
+                      assets[os.path.basename(p)] = p
+              if not assets:
+                  raise SystemExit(
+                      "error: no .zip assets downloaded for release %s - "
+                      "leaving the catalog untouched (this guards against "
+                      "a failed download wiping entries)" % tag)
+              items, wrapper = load_catalog()
+              raw_pfx = "/releases/download/" + tag + "/"
+              quot_pfx = ("/releases/download/"
+                          + url_quote(tag, safe="") + "/")
+              kept = []
+              matched = set()
+              added = refreshed = removed = 0
+              unmatched_entries = []
+
+              # Pass 1: exact filename match -> refresh in place.
+              for e in items:
+                  if not isinstance(e, dict):
+                      kept.append(e)
+                      continue
+                  link = str(e.get("link", ""))
+                  if raw_pfx not in link and quot_pfx not in link:
+                      kept.append(e)
+                      continue
+                  fn = link.rsplit("/", 1)[-1]
+                  label = e.get("id") or e.get("name", "?")
+                  if fn and fn in assets:
+                      zp = assets[fn]
+                      new_sha = sha256_of(zp)
+                      new_size = os.path.getsize(zp)
+                      new_link = build_link(repo, tag, fn)
+                      cat, ptype, name, ver, id_, vf, pf = derive_from(
+                          fn, zp, tag)
+                      changed = False
+                      if (e.get("sha256") != new_sha
+                              or e.get("size_bytes") != new_size
+                              or e.get("link") != new_link):
+                          e["sha256"] = new_sha
+                          e["size_bytes"] = new_size
+                          e["link"] = new_link
+                          changed = True
+                      if vf and e.get("version") != ver:
+                          e["version"] = ver
+                          changed = True
+                      if pf and e.get("plugin_type") != ptype:
+                          e["plugin_type"] = ptype
+                          changed = True
+                      cleaned = clean_name_token(e.get("name", ""))
+                      if (cleaned is not None
+                              and e.get("name") != cleaned):
+                          e["name"] = cleaned
+                          changed = True
+                      if changed:
+                          e["last_updated"] = today
+                          refreshed += 1
+                          print("refreshed %s (asset %s still in release)"
+                                % (label, fn))
+                      else:
+                          print("unchanged %s (asset %s same content)"
+                                % (label, fn))
+                      kept.append(e)
+                      matched.add(fn)
+                  else:
+                      unmatched_entries.append(e)
+
+              # Pass 2: base-key match for renamed assets -> refactor in place.
+              remaining = {fn: assets[fn] for fn in assets
+                           if fn not in matched}
+              still_unmatched = []
+              for e in unmatched_entries:
+                  old_fn = str(e.get("link", "")).rsplit("/", 1)[-1]
+                  old_base = base_key(old_fn)
+                  match_fn = None
+                  for afn in remaining:
+                      if base_key(afn) == old_base:
+                          match_fn = afn
+                          break
+                  if match_fn:
+                      zp = remaining[match_fn]
+                      e["link"] = build_link(repo, tag, match_fn)
+                      e["sha256"] = sha256_of(zp)
+                      e["size_bytes"] = os.path.getsize(zp)
+                      e["last_updated"] = today
+                      cat, ptype, name, ver, id_, vf, pf = derive_from(
+                          match_fn, zp, tag)
+                      if vf and e.get("version") != ver:
+                          e["version"] = ver
+                      if pf and e.get("plugin_type") != ptype:
+                          e["plugin_type"] = ptype
+                      cleaned = clean_name_token(e.get("name", ""))
+                      if cleaned is not None and e.get("name") != cleaned:
+                          e["name"] = cleaned
+                      kept.append(e)
+                      matched.add(match_fn)
+                      del remaining[match_fn]
+                      refreshed += 1
+                      print("renamed %s -> %s (refactored in place)"
+                            % (old_fn, match_fn))
+                  else:
+                      still_unmatched.append(e)
+
+              for e in still_unmatched:
+                  removed += 1
+                  label = e.get("id") or e.get("name", "?")
+                  fn = str(e.get("link", "")).rsplit("/", 1)[-1]
+                  print("removed %s (asset %s no longer in release)"
+                        % (label, fn))
+
+              for fn in sorted(remaining):
+                  zp = remaining[fn]
+                  cat, ptype, name, ver, id_, vf, pf = derive_from(
+                      fn, zp, tag)
+                  link = build_link(repo, tag, fn)
+                  kept.append(new_entry(id_, cat, name, ver, today, link,
+                                        sha256_of(zp),
+                                        os.path.getsize(zp), ptype))
+                  added += 1
+                  print("added %s (%s%s) from %s"
+                        % (id_, cat, "/" + ptype if ptype else "", fn))
+
+              kept, dedup_removed = dedupe(kept)
+              removed += dedup_removed
+              save_catalog(kept, wrapper)
+              print("reconcile %s: +%d added, %d refreshed, %d removed "
+                    "(%d deduped) -> %d total"
+                    % (tag, added, refreshed, removed, dedup_removed,
+                       len(kept)))
+
+          def main():
+              if ACTION in ("unpublished", "deleted"):
+                  items, wrapper = load_catalog()
+                  raw = "/releases/download/" + TAG + "/"
+                  quoted = ("/releases/download/"
+                            + url_quote(TAG, safe="") + "/")
+                  kept, removed = [], []
+                  for e in items:
+                      link = e.get("link") if isinstance(e, dict) else None
+                      if (isinstance(link, str)
+                              and (raw in link or quoted in link)):
+                          removed.append(e)
+                      else:
+                          kept.append(e)
+                  if not removed:
+                      print("release %s: no catalog entries point at "
+                            "it - nothing to remove" % TAG)
+                      return
+                  for e in removed:
+                      print("removed %s (was %s)"
+                            % (e.get("id", "?"), e.get("link", "")))
+                  save_catalog(kept, wrapper)
+                  print("wrote %s (%d entr%s remain)"
+                        % (CATALOG, len(kept),
+                           "y" if len(kept) == 1 else "ies"))
+                  return
+              reconcile(ASSET_DIR, TAG, REPO,
+                        datetime.date.today().isoformat())
+
+          main()
+          PYEOF
+          python3 "$RUNNER_TEMP/auto_catalog.py" "$RUNNER_TEMP/assets"
+
+      - name: Commit and push to the catalog repo
+        env:
+          RELEASE_ACTION: ${{ github.event.action || 'edited' }}
+          RELEASE_TAG: ${{ inputs.tag || 'Plugins' }}
+          CATALOG_FILE: ${{ vars.CATALOG_FILE || 'After-Effect-HUB.json' }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "$CATALOG_FILE"
+          if git diff --cached --quiet; then
+            echo "catalog.json unchanged - nothing to commit"
+          else
+            if [ "$RELEASE_ACTION" = "published" ]; then
+              git commit -m "auto-catalog: ${RELEASE_TAG}"
+            else
+              git commit -m "auto-catalog: ${RELEASE_TAG}"
+            fi
+            git push
+          fi
