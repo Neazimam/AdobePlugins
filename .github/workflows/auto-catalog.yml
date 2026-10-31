@@ -1,1 +1,693 @@
 
+# EAGLE auto-catalog - zero-command publishing for After-Effect-HUB.
+#
+# ONE-TIME SETUP (two-repo layout)
+# --------------------------------
+# You have TWO repos:
+#   - AdobePlugins      : holds the releases (the .zip assets live here)
+#   - After-Effect-HUB  : holds After-Effect-HUB.json (the catalog EAGLE
+#                         fetches - matches fetch.cpp's primary_url)
+#
+# This workflow file goes in the ASSET repo (AdobePlugins), because that is
+# the repo whose `release` events must trigger it. A workflow placed in
+# After-Effect-HUB would never see AdobePlugins' releases.
+#
+# Steps:
+#   1. Create a fine-grained PAT with Contents: Read and write on
+#      After-Effect-HUB  (GitHub -> Settings -> Developer settings ->
+#      Personal access tokens -> Fine-grained tokens -> Generate). Copy it.
+#   2. In AdobePlugins -> Settings -> Secrets and variables -> Actions ->
+#      New repository secret -> Name: CATALOG_TOKEN -> paste the PAT.
+#   3. (Optional) AdobePlugins -> Variables -> New variable ->
+#      Name: CATALOG_REPO -> Value: <owner>/After-Effect-HUB. Skip this if
+#      your GitHub username is "Neazimam" (the default below matches).
+#      The catalog FILENAME defaults to "After-Effect-HUB.json" (matching
+#      your repo + fetch.cpp); override only via a CATALOG_FILE variable
+#      if it ever differs.
+#   4. Add this file at  .github/workflows/auto-catalog.yml  in AdobePlugins.
+#   5. Publish a test release in AdobePlugins; ~30 s later the bot commits
+#      After-Effect-HUB.json in After-Effect-HUB.
+#
+# Manual catch-up / debugging: AdobePlugins -> Actions tab -> "Auto
+# catalog" -> "Run workflow" -> enter the release tag (e.g. Plugins) ->
+# Run. Runs the same reconcile on demand - handy for the first deploy or
+# when a release event didn't fire. Watch the live log to see exactly
+# what happened.
+#
+# Auto self-heal: the workflow ALSO runs on a schedule every 6 hours,
+# re-reconciling the Plugins release (override via the SCHEDULE_TAG
+# variable). So even if a release event was missed or a broken entry
+# slipped in, it auto-fixes within 6 hours - no manual trigger needed.
+#
+# Stuck-run protection: a concurrency group ensures only ONE run at a
+# time; a new run AUTO-CANCELS any stuck/queued one, and a 15-minute
+# timeout kills hung runs. So you never get a blocked queue or a
+# "Failed to cancel" dead-end.
+#
+# The built-in GITHUB_TOKEN downloads AdobePlugins' own releases; the PAT
+# is only used to check out and push to After-Effect-HUB.
+#
+# FROM THEN ON, PUBLISHING = ZERO COMMANDS
+# ----------------------------------------
+#   1. GitHub -> Releases -> "Draft a new release"
+#   2. Tag it, e.g.  v1.4.3   (conventions below)
+#   3. Attach your .zip file(s), click "Publish release"
+#   4. ~30 seconds later this workflow updates After-Effect-HUB.json for you
+#      (commit author: github-actions[bot]). EAGLE -> Refresh shows it.
+#   Delete or unpublish a release -> its catalog entries are removed
+#      the same way. Editing a release (add / remove / re-upload an asset)
+#      reconciles the catalog: new assets appear, removed ones vanish,
+#      re-uploaded ones get fresh sha/size - your hand-edited name /
+#      version / category / description / tags are always preserved.
+#      Still zero manual JSON edits, in either direction.
+#
+# HOW THE TYPE IS DETECTED (for every .zip in the release)
+# --------------------------------------------------------
+#   1. Tag prefix wins, if the tag starts with one of:
+#        extension-...  -> extension (CEP, Common Files/Adobe/CEP/extensions)
+#        plugin-...     -> plugin    (AE Plug-ins)
+#        aeplugin-...   -> plugin    (AE Plug-ins)
+#        script-...     -> script    (ScriptUI Panels)
+#        core-...       -> plugin    (MediaCore)
+#   2. Otherwise the workflow looks INSIDE the zip:
+#        CSXS/manifest.xml present  -> extension (every CEP ext has it)
+#        any .aex                   -> plugin
+#        any .jsx / .jsxbin         -> script
+#      (CSXS is checked first because extensions often bundle .jsx hosts)
+#   3. Nothing matched -> plugin (aeplugin), with a note in the run log.
+#
+# NAME / VERSION / ID
+# -------------------
+#   tag "plugin-Chromabba-v1.4.3" + "Chromabba-1.4.3.zip"
+#     -> id chromabba, name Chromabba, version 1.4.3
+#   bare tag "v1.4.3" -> name/version come from each zip's filename, so
+#     multi-zip releases work ("Bionic Blur 1.2.zip" -> "Bionic Blur" 1.2;
+#     a version-less, prefix-less tag like "release" behaves the same)
+#   Keep the base file name stable across versions ("Chromabba-1.4.3.zip"
+#   -> "Chromabba-1.4.4.zip") so the SAME entry gets bumped instead of
+#   duplicated. Bumps keep your hand-edited name/description/category/
+#   tags; only version/last_updated/link/sha256/size_bytes are updated.
+#
+# PLUGIN SUBTYPE: aeplugin vs core
+# -------------------------------
+# Plugins install to either AE Plug-ins (aeplugin) or MediaCore (core).
+# The subtype is picked in this priority:
+#   1. Tag prefix:  core-... -> core ; plugin-/aeplugin-... -> aeplugin
+#   2. Filename token (for the one-tag-for-all-assets model where the tag
+#      can't carry a per-asset prefix):
+#        Name.core.zip      -> core     (MediaCore)
+#        Name.aeplugin.zip  -> aeplugin (AE Plug-ins)
+#      Token-boundary aware: "CoreFX.zip" / "hardcore.zip" stay default.
+#   3. Default: aeplugin.
+# Existing entries' plugin_type is PRESERVED on every reconcile - set it
+# by hand once in After-Effect-HUB.json and it sticks across all refreshes.
+
+name: Auto catalog
+
+on:
+  release:
+    types: [published, edited, unpublished, deleted]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to reconcile (e.g. Plugins) - used when you click "Run workflow" manually'
+        required: true
+        type: string
+  schedule:
+    # Self-heal: re-reconcile the Plugins release every 6 hours so any
+    # broken entry (stale name, wrong plugin_type, duplicate, missing
+    # comma) auto-fixes even if a release event was missed. Override the
+    # target tag via the SCHEDULE_TAG variable; defaults to Plugins.
+    - cron: '0 */6 * * *'
+
+# contents:read is enough for the GITHUB_TOKEN to download AdobePlugins'
+# own releases. Writing catalog.json to After-Effect-HUB goes through the
+# PAT (CATALOG_TOKEN), which this permissions key does not scope.
+permissions:
+  contents: read
+
+# Only ONE run at a time. A new run AUTO-CANCELS any stuck/queued one,
+# so a hung run never blocks the queue (the "Failed to cancel" /
+# stuck-Queued problem). Combined with the 6h schedule + timeout below,
+# the workflow is fully self-managing - you never have to manually cancel.
+concurrency:
+  group: auto-catalog
+  cancel-in-progress: true
+
+jobs:
+  auto-catalog:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out the catalog repo (After-Effect-HUB)
+        uses: actions/checkout@v4
+        with:
+          # The catalog lives in a DIFFERENT repo than the releases.
+          # CATALOG_REPO variable = "<owner>/After-Effect-HUB" (set it in
+          # AdobePlugins -> Variables); defaults to Neazimam/After-Effect-HUB.
+          repository: ${{ vars.CATALOG_REPO || 'Neazimam/After-Effect-HUB' }}
+          # PAT with Contents:write on After-Effect-HUB (secret CATALOG_TOKEN
+          # in AdobePlugins). Omit repository+token if you merge the repos.
+          token: ${{ secrets.CATALOG_TOKEN }}
+
+      - name: Download the release .zip assets
+        if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' || github.event.action == 'published' || github.event.action == 'edited' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag || vars.SCHEDULE_TAG || 'Plugins' }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/assets"
+          gh release download "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern '*.zip' --pattern '*.ZIP' \
+            --clobber --dir "$RUNNER_TEMP/assets"
+          ls -la "$RUNNER_TEMP/assets"
+
+      - name: Add, update, or remove catalog entries
+        env:
+          RELEASE_ACTION: ${{ github.event.action || 'edited' }}
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag || vars.SCHEDULE_TAG || 'Plugins' }}
+          RELEASE_REPO: ${{ github.repository }}
+          CATALOG_FILE: ${{ vars.CATALOG_FILE || 'After-Effect-HUB.json' }}
+        run: |
+          cat > "$RUNNER_TEMP/auto_catalog.py" <<'PYEOF'
+          import datetime
+          import glob
+          import hashlib
+          import json
+          import os
+          import re
+          import sys
+          import zipfile
+          from urllib.parse import quote as url_quote
+
+          ASSET_DIR = sys.argv[1]
+          ACTION = os.environ.get("RELEASE_ACTION", "published").strip()
+          TAG = os.environ.get("RELEASE_TAG", "").strip()
+          REPO = os.environ.get("RELEASE_REPO", "").strip()
+          CATALOG = (os.environ.get("CATALOG_FILE", "").strip()
+                    or "After-Effect-HUB.json")
+
+          # Canonical key order matches src/catalog/fetch.h struct order.
+          ENTRY_KEY_ORDER = [
+              "id", "category", "name", "version", "last_updated",
+              "link", "sha256", "size_bytes", "description", "tags",
+              "plugin_type",
+          ]
+
+          # Tag prefixes that explicitly declare the package type.
+          # Format: (prefix, category, plugin_type). First match wins.
+          TAG_PREFIXES = [
+              ("extension-", "extension", None),
+              ("aeplugin-", "plugin", "aeplugin"),
+              ("plugin-", "plugin", "aeplugin"),
+              ("script-", "script", None),
+              ("core-", "plugin", "core"),
+          ]
+
+          # Trailing version in a tag / filename:
+          # "Chromabba-1.4.3", "v2.0", "Suite 16", "Cyclops.4.0.0"
+          # (dots, hyphens, underscores, spaces all work as separators)
+          VER_RE = re.compile(
+              r"(?:^|[-_. ])(?:v|ver-?)?(\d+(?:\.\d+)*)\s*$", re.IGNORECASE)
+
+          def sha256_of(path):
+              h = hashlib.sha256()
+              with open(path, "rb") as f:
+                  for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          def load_catalog():
+              if not os.path.exists(CATALOG):
+                  print("note: catalog.json not found - creating a new one")
+                  return [], None
+              with open(CATALOG, "r", encoding="utf-8") as f:
+                  text = f.read()
+              data = _parse_lenient(text)
+              if isinstance(data, list):
+                  return data, None
+              if isinstance(data, dict) and isinstance(data.get("items"), list):
+                  return data["items"], data
+              raise SystemExit(
+                  "error: catalog.json is neither [...] nor {'items': [...]}")
+
+          def _parse_lenient(text):
+              """Parse JSON, auto-repairing common hand-edit errors
+              (missing comma between two objects, or between two string
+              keys). Reports the repair so you know your hand-edit was
+              fixed - you don't have to be a JSON expert."""
+              try:
+                  return json.loads(text)
+              except json.JSONDecodeError:
+                  pass
+              repaired = text
+              repaired = re.sub(r"}\s*\n\s*{", "},\n  {", repaired)
+              repaired = re.sub(r'"\s*\n\s*"', '",\n  "', repaired)
+              try:
+                  data = json.loads(repaired)
+                  print("note: catalog had a JSON syntax error "
+                        "(likely a missing comma from a hand-edit); "
+                        "auto-repaired and continued.")
+                  return data
+              except json.JSONDecodeError as e:
+                  raise SystemExit(
+                      "error: After-Effect-HUB.json has a JSON syntax "
+                      "error I could not auto-repair: %s (line %d). "
+                      "Open the file, find that line, and add the "
+                      "missing comma or quote." % (e, e.lineno))
+
+          def save_catalog(items, wrapper):
+              out = items if wrapper is None else {**wrapper, "items": items}
+              with open(CATALOG, "w", encoding="utf-8") as f:
+                  f.write(json.dumps(out, indent=2, ensure_ascii=False) + "\n")
+
+          def sniff(zip_path):
+              """Look INSIDE the zip to decide what kind of package it is.
+              CEP extensions must ship CSXS/manifest.xml; AE plugins are
+              .aex binaries; scripts are .jsx / .jsxbin files. CSXS is
+              checked first because extensions often bundle .jsx hosts."""
+              try:
+                  with zipfile.ZipFile(zip_path) as z:
+                      names = [n.lower().replace("\\", "/")
+                               for n in z.namelist() if not n.endswith("/")]
+              except zipfile.BadZipFile:
+                  return None
+              if any(n.endswith("csxs/manifest.xml") for n in names):
+                  return "extension"
+              if any(n.endswith(".aex") for n in names):
+                  return "plugin"
+              if any(n.endswith(".jsx") or n.endswith(".jsxbin")
+                     for n in names):
+                  return "script"
+              return None
+
+          def split_prefix(text):
+              t = text.strip()
+              for pfx, cat, ptype in TAG_PREFIXES:
+                  if t.lower().startswith(pfx):
+                      return cat, ptype, t[len(pfx):]
+              return None, None, t
+
+          def split_version(text):
+              """'Chromabba-1.4.3' -> ('Chromabba', '1.4.3')
+              'v2.0' -> ('', '2.0'); 'NeoGrade' -> ('NeoGrade', None)"""
+              m = VER_RE.search(text)
+              if not m:
+                  return text.strip(" -_"), None
+              return text[:m.start()].strip(" -_"), m.group(1)
+
+          def display_name(raw):
+              return re.sub(r"[-_]+", " ", raw).strip()
+
+          def make_id(name):
+              s = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+              return s or "entry"
+
+          def clean_name_token(name):
+              """Strip a trailing .core / .aeplugin token left over in the
+              display name by an older workflow version (which didn't strip
+              it). Returns the cleaned name, or None if there was no
+              trailing token to strip (so callers can tell)."""
+              m = re.match(r"^(.+?)[._-](core|aeplugin)$", str(name),
+                           re.IGNORECASE)
+              if m:
+                  return display_name(m.group(1))
+              return None
+
+          def base_key(text):
+              """Normalize a package name for comparison: lowercase, drop
+              the version suffix AND any core/aeplugin token, drop all
+              non-alphanumerics. "Bionic Blur 1.2", "bionic-blur-1.0",
+              and "Bionic.core-1.0" all -> "bionicblur"."""
+              stem = re.sub(r"\.(zip|zxp|aex|jsx|jsxbin|json)$", "", str(text),
+                            flags=re.IGNORECASE)
+              stem = re.sub(r"(?:^|[-_.])(?:core|aeplugin)(?:[-_.]|$)", " ",
+                            stem, flags=re.IGNORECASE)
+              name, _ = split_version(stem)
+              return re.sub(r"[^a-z0-9]+", "", (name or stem).lower())
+
+          def version_key(v):
+              """Parse a version string into a list of ints for sorting.
+              '1.4.3' -> [1,4,3]; '2' -> [2]; '2026' -> [2026].
+              Non-numeric segments -> 0. Longer = newer when prefix equal."""
+              parts = []
+              for p in str(v).split("."):
+                  m = re.match(r"^(\d+)", p)
+                  parts.append(int(m.group(1)) if m else 0)
+              return parts
+
+          def link_version(entry):
+              """Extract the version from the entry's release-link
+              filename (the source of truth - more reliable than the
+              version field, which may be hand-set or stale from an
+              older workflow version)."""
+              fn = str(entry.get("link", "")).rsplit("/", 1)[-1]
+              stem = re.sub(r"\.[A-Za-z0-9]{1,5}$", "", fn)
+              _, ver = split_version(stem)
+              return ver or entry.get("version", "0") or "0"
+
+          def dedupe(items):
+              """Remove same-package duplicates: group entries by
+              (category, normalized name) and keep only the NEWEST
+              version in each group (comparing versions parsed from the
+              release-link filenames). Hand-edited description/tags from
+              a removed old entry are merged onto the keeper if it lacks
+              them. Entries with different categories are NOT merged
+              (same name, different type = different package)."""
+              groups = {}
+              order = []
+              non_dicts = []
+              for e in items:
+                  if not isinstance(e, dict):
+                      non_dicts.append(e)
+                      continue
+                  key = (e.get("category", ""),
+                         base_key(e.get("name", "")))
+                  if key not in groups:
+                      groups[key] = []
+                      order.append(key)
+                  groups[key].append(e)
+              deduped = list(non_dicts)
+              removed = 0
+              for key in order:
+                  group = groups[key]
+                  if len(group) <= 1:
+                      deduped.extend(group)
+                      continue
+                  keeper = max(
+                      group,
+                      key=lambda e: version_key(link_version(e)))
+                  for e in group:
+                      if e is keeper:
+                          continue
+                      # merge hand-edits from the old entry onto keeper
+                      if (not keeper.get("description")
+                              and e.get("description")):
+                          keeper["description"] = e["description"]
+                      if not keeper.get("tags") and e.get("tags"):
+                          keeper["tags"] = e["tags"]
+                      removed += 1
+                      print("deduped: removed %s %s (same package as "
+                            "%s; kept %s)"
+                            % (e.get("name", "?"),
+                               link_version(e),
+                               keeper.get("name", "?"),
+                               link_version(keeper)))
+                  deduped.append(keeper)
+              return deduped, removed
+
+          def new_entry(id_, category, name, version, today, link, sha,
+                        size, ptype):
+              fields = {
+                  "id": id_, "category": category, "name": name,
+                  "version": version, "last_updated": today, "link": link,
+                  "sha256": sha, "size_bytes": size,
+                  "description": "", "tags": [], "plugin_type": ptype,
+              }
+              out = {}
+              for k in ENTRY_KEY_ORDER:
+                  v = fields[k]
+                  if v in (None, "", [], {}):
+                      continue
+                  out[k] = v
+              return out
+
+          def remove_for_tag(items, tag):
+              """Remove every catalog entry whose link points at this
+              release's tag (handles both raw and URL-quoted tag forms
+              so hand-built links and auto-generated ones both match)."""
+              raw = "/releases/download/" + tag + "/"
+              quoted = ("/releases/download/"
+                        + url_quote(tag, safe="") + "/")
+              kept, removed = [], []
+              for e in items:
+                  link = e.get("link") if isinstance(e, dict) else None
+                  if (isinstance(link, str)
+                          and (raw in link or quoted in link)):
+                      removed.append(e)
+                  else:
+                      kept.append(e)
+              return kept, removed
+
+          def build_link(repo, tag, fname):
+              return ("https://github.com/" + repo + "/releases/download/"
+                      + url_quote(tag, safe="") + "/"
+                      + url_quote(fname, safe=""))
+
+          def derive_from(fname, zip_path, tag):
+              """Derive category/name/version/id for a new asset. Returns
+              (category, ptype, name, version, id_, version_found,
+              ptype_found). version_found is False when version fell back
+              to 1.0.0; ptype_found is False when the plugin subtype
+              defaulted to aeplugin (no tag prefix or filename token) -
+              callers use both to preserve hand-edited values on refresh."""
+              stem = re.sub(r"\.[A-Za-z0-9]{1,5}$", "", fname)
+              tcat, tptype, trest = split_prefix(tag)
+              tname, tver = split_version(trest)
+              tag_named = bool(tname) and (tver is not None
+                                           or tcat is not None)
+              # For naming, strip a core/aeplugin token from the stem so
+              # "Newton.core.zip" -> name "Newton" (not "Newton.core").
+              # Token-boundary aware; falls back to the raw stem if
+              # stripping would empty it (a plugin literally named Core).
+              stem_name = re.sub(
+                  r"(?:^|[-_.])(?:core|aeplugin)(?:[-_.]|$)", " ", stem,
+                  flags=re.IGNORECASE).strip(" -_.") or stem
+              fn_name, fn_ver = split_version(stem_name)
+              if tag_named:
+                  name = display_name(tname)
+                  version = tver or fn_ver or "1.0.0"
+              else:
+                  name = display_name(fn_name or stem_name)
+                  version = fn_ver or tver or "1.0.0"
+              version_found = (tver is not None) or (fn_ver is not None)
+              category = tcat or sniff(zip_path)
+              ptype = tptype
+              ptype_found = tptype is not None
+              if category is None:
+                  print("note: %s: type not detected from contents - "
+                        "defaulting to plugin (use a tag prefix like "
+                        "plugin-... to force one)" % fname)
+                  category = "plugin"
+              if category == "plugin" and not ptype:
+                  # No tag prefix declared the subtype. In the one-tag-
+                  # for-all-assets model the tag can't carry a per-asset
+                  # prefix, so let the FILENAME declare it:
+                  #   Name.core.zip      -> core     (MediaCore)
+                  #   Name.aeplugin.zip  -> aeplugin (AE Plug-ins)
+                  # Boundary-aware: "CoreFX" / "hardcore" stay default.
+                  sl = stem.lower()
+                  if re.search(r"(?:^|[-_.])core(?:[-_.]|$)", sl):
+                      ptype = "core"
+                      ptype_found = True
+                  elif re.search(r"(?:^|[-_.])aeplugin(?:[-_.]|$)", sl):
+                      ptype = "aeplugin"
+                      ptype_found = True
+              if category == "plugin" and not ptype:
+                  ptype = "aeplugin"
+              return (category, ptype, name, version, make_id(name),
+                      version_found, ptype_found)
+
+          def reconcile(asset_dir, tag, repo, today):
+              """Reconcile the catalog against the FULL asset list of one
+              release, in TWO passes:
+                1. Exact filename match - refresh sha/size/link, version
+                   (when parsed from the name), and plugin_type (when a
+                   signal token/prefix is present); preserve hand-edited
+                   name/description/tags. Also strips a stale .core/.aeplugin
+                   suffix baked into names by older workflow versions.
+                2. Base-key match for RENAMED assets (e.g. Glitchify-1.0.0
+                   re-uploaded as Glitchify-1.0.1, or Newton.zip renamed
+                   Newton.core.zip) - refactor the SAME entry in place to
+                   the new filename, preserving hand-edits.
+              Then dedupe: same name + same category, multiple versions ->
+              keep the newest (by link-filename version), merge hand-edits.
+              Assets with no match are added; entries with no match are
+              removed. An empty download aborts without touching the
+              catalog (guards against a failed download wiping entries)."""
+              assets = {}
+              for p in sorted(glob.glob(os.path.join(asset_dir, "*"))):
+                  if p.lower().endswith(".zip"):
+                      assets[os.path.basename(p)] = p
+              if not assets:
+                  raise SystemExit(
+                      "error: no .zip assets downloaded for release %s - "
+                      "leaving the catalog untouched (this guards against "
+                      "a failed download wiping entries)" % tag)
+              items, wrapper = load_catalog()
+              raw_pfx = "/releases/download/" + tag + "/"
+              quot_pfx = ("/releases/download/"
+                          + url_quote(tag, safe="") + "/")
+              kept = []
+              matched = set()
+              added = refreshed = removed = 0
+              unmatched_entries = []
+
+              # Pass 1: exact filename match -> refresh in place.
+              for e in items:
+                  if not isinstance(e, dict):
+                      kept.append(e)
+                      continue
+                  link = str(e.get("link", ""))
+                  if raw_pfx not in link and quot_pfx not in link:
+                      kept.append(e)
+                      continue
+                  fn = link.rsplit("/", 1)[-1]
+                  label = e.get("id") or e.get("name", "?")
+                  if fn and fn in assets:
+                      zp = assets[fn]
+                      new_sha = sha256_of(zp)
+                      new_size = os.path.getsize(zp)
+                      new_link = build_link(repo, tag, fn)
+                      cat, ptype, name, ver, id_, vf, pf = derive_from(
+                          fn, zp, tag)
+                      changed = False
+                      if (e.get("sha256") != new_sha
+                              or e.get("size_bytes") != new_size
+                              or e.get("link") != new_link):
+                          e["sha256"] = new_sha
+                          e["size_bytes"] = new_size
+                          e["link"] = new_link
+                          changed = True
+                      if vf and e.get("version") != ver:
+                          e["version"] = ver
+                          changed = True
+                      # Flip plugin_type only when a signal (token/prefix)
+                      # declared one - never overwrite a hand-set value
+                      # with the default aeplugin.
+                      if pf and e.get("plugin_type") != ptype:
+                          e["plugin_type"] = ptype
+                          changed = True
+                      # Clean up a stale '.core' / '.aeplugin' suffix that
+                      # an older workflow version baked into the name.
+                      cleaned = clean_name_token(e.get("name", ""))
+                      if (cleaned is not None
+                              and e.get("name") != cleaned):
+                          e["name"] = cleaned
+                          changed = True
+                      if changed:
+                          e["last_updated"] = today
+                          refreshed += 1
+                          print("refreshed %s (asset %s still in release)"
+                                % (label, fn))
+                      else:
+                          print("unchanged %s (asset %s same content)"
+                                % (label, fn))
+                      kept.append(e)
+                      matched.add(fn)
+                  else:
+                      unmatched_entries.append(e)
+
+              # Pass 2: base-key match for renamed assets -> refactor in
+              # place. Keeps the entry's id/name/description/tags; swaps
+              # link + sha + size + version (+ plugin_type if signaled).
+              remaining = {fn: assets[fn] for fn in assets
+                           if fn not in matched}
+              still_unmatched = []
+              for e in unmatched_entries:
+                  old_fn = str(e.get("link", "")).rsplit("/", 1)[-1]
+                  old_base = base_key(old_fn)
+                  match_fn = None
+                  for afn in remaining:
+                      if base_key(afn) == old_base:
+                          match_fn = afn
+                          break
+                  if match_fn:
+                      zp = remaining[match_fn]
+                      e["link"] = build_link(repo, tag, match_fn)
+                      e["sha256"] = sha256_of(zp)
+                      e["size_bytes"] = os.path.getsize(zp)
+                      e["last_updated"] = today
+                      cat, ptype, name, ver, id_, vf, pf = derive_from(
+                          match_fn, zp, tag)
+                      if vf and e.get("version") != ver:
+                          e["version"] = ver
+                      if pf and e.get("plugin_type") != ptype:
+                          e["plugin_type"] = ptype
+                      cleaned = clean_name_token(e.get("name", ""))
+                      if cleaned is not None and e.get("name") != cleaned:
+                          e["name"] = cleaned
+                      kept.append(e)
+                      matched.add(match_fn)
+                      del remaining[match_fn]
+                      refreshed += 1
+                      print("renamed %s -> %s (refactored in place; your "
+                            "name/description/tags preserved)"
+                            % (old_fn, match_fn))
+                  else:
+                      still_unmatched.append(e)
+
+              # Truly removed entries (asset gone, no rename match).
+              for e in still_unmatched:
+                  removed += 1
+                  label = e.get("id") or e.get("name", "?")
+                  fn = str(e.get("link", "")).rsplit("/", 1)[-1]
+                  print("removed %s (asset %s no longer in release)"
+                        % (label, fn))
+
+              # Truly new assets (no existing entry, no rename match).
+              for fn in sorted(remaining):
+                  zp = remaining[fn]
+                  cat, ptype, name, ver, id_, vf, pf = derive_from(
+                      fn, zp, tag)
+                  link = build_link(repo, tag, fn)
+                  kept.append(new_entry(id_, cat, name, ver, today, link,
+                                        sha256_of(zp),
+                                        os.path.getsize(zp), ptype))
+                  added += 1
+                  print("added %s (%s%s) from %s"
+                        % (id_, cat, "/" + ptype if ptype else "", fn))
+
+              kept, dedup_removed = dedupe(kept)
+              removed += dedup_removed
+              save_catalog(kept, wrapper)
+              print("reconcile %s: +%d added, %d refreshed, %d removed "
+                    "(%d deduped) -> %d total"
+                    % (tag, added, refreshed, removed, dedup_removed,
+                       len(kept)))
+
+          def main():
+              if ACTION in ("unpublished", "deleted"):
+                  items, wrapper = load_catalog()
+                  kept, removed = remove_for_tag(items, TAG)
+                  if not removed:
+                      print("release %s: no catalog entries point at "
+                            "it - nothing to remove" % TAG)
+                      return
+                  for e in removed:
+                      print("removed %s (was %s)"
+                            % (e.get("id", "?"), e.get("link", "")))
+                  save_catalog(kept, wrapper)
+                  print("wrote %s (%d entr%s remain)"
+                        % (CATALOG, len(kept),
+                           "y" if len(kept) == 1 else "ies"))
+                  return
+              # published or edited -> reconcile against this release's
+              # full asset list (handles add, remove, and re-upload).
+              reconcile(ASSET_DIR, TAG, REPO,
+                        datetime.date.today().isoformat())
+
+          main()
+          PYEOF
+          python3 "$RUNNER_TEMP/auto_catalog.py" "$RUNNER_TEMP/assets"
+
+      - name: Commit and push to the catalog repo
+        env:
+          RELEASE_ACTION: ${{ github.event.action || 'edited' }}
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag || vars.SCHEDULE_TAG || 'Plugins' }}
+          CATALOG_FILE: ${{ vars.CATALOG_FILE || 'After-Effect-HUB.json' }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "$CATALOG_FILE"
+          if git diff --cached --quiet; then
+            echo "catalog.json unchanged - nothing to commit"
+          else
+            if [ "$RELEASE_ACTION" = "published" ]; then
+              git commit -m "auto-catalog: ${RELEASE_TAG}"
+            else
+              git commit -m "auto-catalog: removed ${RELEASE_TAG}"
+            fi
+            git push
+          fi
